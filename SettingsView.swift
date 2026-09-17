@@ -7,8 +7,7 @@ struct SettingsView: View {
     @State private var stations: [NearbyStation] = []
 
     var body: some View {
-        NavigationStack {
-            List {
+        List {
                 Section("Accessibilité") {
                     Toggle(isOn: $announcementsEnabled) {
                         Label("Annonces voyageurs", systemImage: "speaker.wave.2.fill")
@@ -35,15 +34,14 @@ struct SettingsView: View {
                         }
                     }
                 }
-            }
-            .navigationTitle("Paramètres")
-            .task {
-                do {
-                    async let loadedLines = T2CService.shared.getLines()
-                    async let loadedStations = T2CService.shared.getStations()
-                    (lines, stations) = try await (loadedLines, loadedStations)
-                } catch { }
-            }
+        }
+        .navigationTitle("Paramètres")
+        .task {
+            do {
+                async let loadedLines = T2CService.shared.getLines()
+                async let loadedStations = T2CService.shared.getStations()
+                (lines, stations) = try await (loadedLines, loadedStations)
+            } catch { }
         }
     }
 }

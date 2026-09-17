@@ -44,6 +44,13 @@ final class HomeViewModel: NSObject, ObservableObject, CLLocationManagerDelegate
     /// Évite certains appels inutiles lorsque CLLocationManager
     /// initialise son delegate.
     private var wantsLocation = false
+    private var refreshingAlerts = false
+
+    /// Informations assez larges pour concerner l'accueil : réseau entier,
+    /// plusieurs lignes ou interruption majeure du tramway.
+    var generalAlerts: [T2CAlert] {
+        globalAlerts.filter(isGeneralCurrentAlert)
+    }
 
     // MARK: - Init
 
@@ -493,13 +500,7 @@ final class HomeViewModel: NSObject, ObservableObject, CLLocationManagerDelegate
         return stations
             .filter { station in
 
-                station.name.range(
-                    of: cleanedQuery,
-                    options: [
-                        .caseInsensitive,
-                        .diacriticInsensitive
-                    ]
-                ) != nil
+                StationSearch.matches(station.name, query: cleanedQuery)
             }
             .sorted {
 
@@ -509,6 +510,72 @@ final class HomeViewModel: NSObject, ObservableObject, CLLocationManagerDelegate
                     )
                     == .orderedAscending
             }
+    }
+
+    // MARK: - Informations réseau
+
+    func refreshGlobalAlerts() async {
+        guard !refreshingAlerts else { return }
+        refreshingAlerts = true
+        defer { refreshingAlerts = false }
+
+        do {
+            globalAlerts = try await T2CService.shared.getGlobalAlerts()
+            trafficUnavailable = false
+        } catch {
+            // Une coupure momentanée ne doit pas faire clignoter l'accueil.
+            trafficUnavailable = true
+        }
+    }
+
+    private func isGeneralCurrentAlert(_ alert: T2CAlert) -> Bool {
+        let content = "\(alert.title) \(alert.text)"
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = content.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: Locale(identifier: "fr_FR")
+        )
+
+        guard !content.isEmpty,
+              !normalized.contains("aucun message"),
+              !normalized.contains("aucune perturbation"),
+              normalized != "inconnu" else { return false }
+
+        let now = Date()
+        if let start = parsedAlertDate(alert.startDatetime), start > now { return false }
+        if let end = parsedAlertDate(alert.endDatetime), end < now { return false }
+
+        let routes = Set(alert.affectedRoutes.filter { !$0.isEmpty })
+        if routes.isEmpty || routes.count > 1 { return true }
+
+        let generalPhrases = ["mouvement social", "greve", "reseau perturbe"]
+        if generalPhrases.contains(where: { normalized.contains($0) }) { return true }
+
+        let tramReferences = Set(lines.filter(\.isTram).flatMap { [$0.routeID, $0.shortName] })
+        let affectsTram = !routes.isDisjoint(with: tramReferences)
+        let interruptionPhrases = [
+            "service interrompu", "circulation interrompue", "ne circule pas",
+            "tramway a l'arret", "tram a l'arret"
+        ]
+        return affectsTram && interruptionPhrases.contains { normalized.contains($0) }
+    }
+
+    private func parsedAlertDate(_ value: String?) -> Date? {
+        guard let value, !value.isEmpty else { return nil }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = iso.date(from: value) { return date }
+        iso.formatOptions = [.withInternetDateTime]
+        if let date = iso.date(from: value) { return date }
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "fr_FR_POSIX")
+        formatter.timeZone = TimeZone(identifier: "Europe/Paris")
+        for format in ["yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd'T'HH:mm:ss"] {
+            formatter.dateFormat = format
+            if let date = formatter.date(from: value) { return date }
+        }
+        return nil
     }
 
     // MARK: - Chargement initial
@@ -575,20 +642,7 @@ final class HomeViewModel: NSObject, ObservableObject, CLLocationManagerDelegate
         // INFORMATIONS RÉSEAU
         // -------------------------
 
-        do {
-
-            globalAlerts =
-                try await T2CService
-                    .shared
-                    .getGlobalAlerts()
-            trafficUnavailable = false
-
-        } catch {
-
-            // Ce n'est pas bloquant.
-            // Les lignes et arrêts restent utilisables.
-            trafficUnavailable = true
-        }
+        await refreshGlobalAlerts()
 
         // -------------------------
         // LOCALISATION

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct HomeView: View {
     @StateObject private var viewModel = HomeViewModel()
+    @StateObject private var groqSummaryVM = GlobalGroqSummaryViewModel()
     @State private var query = ""
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.openURL) private var openURL
@@ -11,6 +12,7 @@ struct HomeView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
                     BrandHeader().padding(.top, 20).padding(.bottom, 16)
+                    GlobalGroqSummaryView(viewModel: groqSummaryVM, lines: viewModel.lines)
                     VStack(alignment: .leading, spacing: 18) {
                         Text("Partir de…")
                             .font(.system(size: 32, weight: .bold)).tracking(-1)
@@ -35,23 +37,51 @@ struct HomeView: View {
                             stationResults
                         }
                     }
-                    TrafficSummaryView(alerts: viewModel.globalAlerts, unavailable: viewModel.trafficUnavailable, loading: viewModel.isLoading)
-
                 }
                 .padding(.horizontal, 24).padding(.bottom, 24)
                 .frame(maxWidth: 640)
                 .frame(maxWidth: .infinity)
             }
             .background(Color(uiColor: .systemBackground))
-            .toolbar(.hidden, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    NavigationLink {
+                        SettingsView()
+                    } label: {
+                        Image(systemName: "gearshape.fill")
+                    }
+                    .accessibilityLabel("Paramètres")
+                }
+            }
+            .toolbarBackground(.hidden, for: .navigationBar)
             .scrollDismissesKeyboard(.interactively)
-            .task { viewModel.locate(); await viewModel.load() }
+            .task {
+                viewModel.locate()
+                await viewModel.load()
+                await groqSummaryVM.summarize(alerts: viewModel.generalAlerts)
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(30))
+                    guard !Task.isCancelled else { break }
+                    await viewModel.refreshGlobalAlerts()
+                    await groqSummaryVM.summarize(alerts: viewModel.generalAlerts)
+                }
+            }
             .onDisappear { viewModel.stopLocating() }
             .onChange(of: scenePhase) { _, phase in
-                if phase == .active { viewModel.locate() }
+                if phase == .active {
+                    viewModel.locate()
+                    Task {
+                        await viewModel.refreshGlobalAlerts()
+                        await groqSummaryVM.summarize(alerts: viewModel.generalAlerts)
+                    }
+                }
                 else { viewModel.stopLocating() }
             }
-            .refreshable { viewModel.locate(); await viewModel.load() }
+            .refreshable {
+                viewModel.locate()
+                await viewModel.load()
+                await groqSummaryVM.summarize(alerts: viewModel.generalAlerts)
+            }
         }
     }
 
@@ -60,10 +90,12 @@ struct HomeView: View {
         let searching = !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let results = searching ? viewModel.search(query) : viewModel.nearest
         VStack(alignment: .leading, spacing: 6) {
-            Text(searching ? "\(results.count) arrêt\(results.count == 1 ? "" : "s")" : "À PROXIMITÉ")
+            Text(searching ? "\(results.count) arrêt\(results.count == 1 ? "" : "s")" : "ARRÊTS À PROXIMITÉ")
                 .font(.caption.weight(.semibold)).tracking(1.5).foregroundStyle(.secondary)
             if !searching {
-                Text(viewModel.locationMessage).font(.footnote).foregroundStyle(.secondary)
+                if viewModel.locationMessage != "Arrêts à proximité de votre position" {
+                    Text(viewModel.locationMessage).font(.footnote).foregroundStyle(.secondary)
+                }
                 if viewModel.location != nil && results.isEmpty {
                     Text("Aucun arrêt T2C dans un rayon de 5 km. Vérifiez votre position ou recherchez un arrêt.")
                         .font(.subheadline).foregroundStyle(.secondary).padding(.vertical, 8)

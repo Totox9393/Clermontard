@@ -33,6 +33,8 @@ struct StationDestinationView: View {
                                         .foregroundStyle(.secondary)
                                 }
                                 .padding(.vertical, 12)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
 
@@ -126,6 +128,13 @@ private struct StationPassagesView: View {
                     Text("Prochains passages")
                         .font(.title2.bold())
 
+                    if let updatedAt {
+                        Text("· \(updatedAt.formatted(date: .omitted, time: .shortened))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("Actualisé à \(updatedAt.formatted(date: .omitted, time: .shortened))")
+                    }
+
                     Spacer()
 
                     if loading {
@@ -149,12 +158,6 @@ private struct StationPassagesView: View {
                             )
                         }
                     }
-                }
-
-                if let updatedAt {
-                    Text("Actualisé à \(updatedAt.formatted(date: .omitted, time: .shortened))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
 
                 ForEach(directionSections) { section in
@@ -202,10 +205,33 @@ private struct StationPassagesView: View {
 
                                     Spacer()
 
-                                    Text(minutesString(for: departure.dueAt))
-                                        .font(.title2.weight(.semibold))
-                                        .monospacedDigit()
-                                        .strikethrough(departure.isCancelled)
+                                    if let timing = timingComparison(for: departure) {
+                                        VStack(alignment: .trailing, spacing: 4) {
+                                            HStack(spacing: 7) {
+                                                Text(minutesString(for: timing.scheduledAt))
+                                                    .foregroundStyle(.secondary)
+                                                    .strikethrough(true, color: .secondary)
+
+                                                Image(systemName: "arrow.right")
+                                                    .font(.caption.weight(.semibold))
+                                                    .foregroundStyle(.secondary)
+
+                                                Text(minutesString(for: timing.estimatedAt))
+                                                    .foregroundStyle(timing.isDelayed ? Color.orange : Color.green)
+                                            }
+                                            .font(.title3.weight(.semibold))
+                                            .monospacedDigit()
+
+                                            Text(timing.label)
+                                                .font(.caption.weight(.semibold))
+                                                .foregroundStyle(timing.isDelayed ? Color.orange : Color.green)
+                                        }
+                                    } else {
+                                        Text(minutesString(for: departure.dueAt))
+                                            .font(.title2.weight(.semibold))
+                                            .monospacedDigit()
+                                            .strikethrough(departure.isCancelled)
+                                    }
                                 }
                                 .padding(.vertical, 4)
                             }
@@ -489,8 +515,10 @@ private struct StationPassagesView: View {
         var results: [T2CTimetableResult] = []
         var failures = 0
 
-        for platform in station.platforms
-        where platform.routeIDs.contains(line.routeID) {
+        // Les identifiants de quai du GTFS et ceux de l'API QR peuvent être
+        // momentanément désynchronisés. On interroge donc tous les quais de
+        // l'arrêt ; getTimetable filtre ensuite strictement la ligne demandée.
+        for platform in station.platforms {
             if Task.isCancelled {
                 return
             }
@@ -543,6 +571,13 @@ private struct StationPassagesView: View {
             messages = loadedMessages
             updatedAt = .now
 
+            if loadedDepartures.isEmpty {
+                print(
+                    "ClermonTard : aucun passage correspondant à la ligne \(line.shortName) "
+                    + "pour les quais \(station.platforms.map(\.id).joined(separator: ", "))."
+                )
+            }
+
             // Mise à jour audio avec des snapshots locaux fiables.
             if allowAnnouncement,
                passengerAnnouncementsEnabled,
@@ -557,11 +592,12 @@ private struct StationPassagesView: View {
             }
         }
 
-        error = failures == 0
-            ? nil
-            : results.isEmpty
+        if failures > 0 {
+            print("ClermonTard : \(failures) quai(s) sans réponse pour \(station.name), ligne \(line.shortName).")
+        }
+        error = results.isEmpty && failures > 0
             ? "Les horaires sont indisponibles. Vérifiez votre connexion puis réessayez."
-            : "Certains quais n’ont pas répondu : les horaires peuvent être incomplets."
+            : nil
 
         do {
             alerts = try await T2CService.shared.getAlerts(
@@ -572,6 +608,23 @@ private struct StationPassagesView: View {
             trafficUnavailable = true
             // On garde les anciennes alertes si l'API ne répond pas.
         }
+    }
+
+    private func timingComparison(for departure: T2CDeparture) -> PassageTimingComparison? {
+        guard !departure.isCancelled,
+              let scheduledAt = departure.scheduledAt,
+              let estimatedAt = departure.estimatedAt else { return nil }
+
+        let difference = estimatedAt.timeIntervalSince(scheduledAt)
+        guard abs(difference) >= 120 else { return nil }
+        let minutes = max(Int((abs(difference) / 60).rounded()), 1)
+        let delayed = difference > 0
+        return PassageTimingComparison(
+            scheduledAt: scheduledAt,
+            estimatedAt: estimatedAt,
+            isDelayed: delayed,
+            label: delayed ? "+\(minutes) min de retard" : "\(minutes) min d’avance"
+        )
     }
 }
 
@@ -585,4 +638,11 @@ private struct PassageSection: Identifiable {
     let id: String
     var title: String
     var departures: [T2CDeparture]
+}
+
+private struct PassageTimingComparison {
+    let scheduledAt: Date
+    let estimatedAt: Date
+    let isDelayed: Bool
+    let label: String
 }

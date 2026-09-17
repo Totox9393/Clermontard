@@ -4,6 +4,7 @@
 //
 
 import Foundation
+import CoreLocation
 import ZIPFoundation
 
 actor T2CService {
@@ -31,6 +32,9 @@ actor T2CService {
     // MARK: - Cache GTFS
 
     private var gtfsIndex: GTFSIndex?
+    private var gtfsResourceURL: URL?
+    private var lineShapeCache: [String: [T2CLineShape]] = [:]
+    private var journeyDepartureCache: [String: JourneyDepartureCache] = [:]
 
     // MARK: - Lignes
 
@@ -43,6 +47,328 @@ actor T2CService {
 
     func getStations() async throws -> [NearbyStation] {
         try await getGTFSIndex().stations
+    }
+
+    /// Charge les tracés seulement à l'ouverture du plan. Le travail ZIP/CSV
+    /// reste sur l'acteur du service et ne bloque donc pas l'interface.
+    func getLineShapes(for routeID: String) async throws -> [T2CLineShape] {
+        if let cached = lineShapeCache[routeID] { return cached }
+
+        let resourceURL: URL
+        if let gtfsResourceURL {
+            resourceURL = gtfsResourceURL
+        } else {
+            resourceURL = try findGTFSURL(in: try await getDatasetMetadata())
+            gtfsResourceURL = resourceURL
+        }
+
+        let (temporaryURL, response) = try await URLSession.shared.download(from: resourceURL)
+        guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
+            throw T2CServiceError.invalidResponse
+        }
+        try Task.checkCancellation()
+
+        let shapes = try await Task.detached(priority: .userInitiated) { [self] in
+            let archive = try Archive(url: temporaryURL, accessMode: .read)
+            let tripsText = try extractText("trips.txt", from: archive)
+            let shapesText = try extractText("shapes.txt", from: archive)
+            try Task.checkCancellation()
+            return buildLineShapes(routeID: routeID, tripsText: tripsText, shapesText: shapesText)
+        }.value
+        if lineShapeCache.count >= 4 {
+            lineShapeCache.removeAll(keepingCapacity: true)
+        }
+        lineShapeCache[routeID] = shapes
+        return shapes
+    }
+
+    // MARK: - Calcul d'itinéraires
+
+    func calculateJourneys(
+        from origin: NearbyStation,
+        to destination: NearbyStation,
+        departureDate: Date = .now,
+        limit: Int = 15,
+        allowWalking: Bool = false
+    ) async throws -> [T2CJourney] {
+        guard origin.id != destination.id else { return [] }
+        let gtfs = try await getGTFSIndex()
+        let candidates = buildJourneyCandidates(
+            from: origin,
+            to: destination,
+            index: gtfs,
+            allowWalking: allowWalking
+        )
+
+        var journeys: [T2CJourney] = []
+        let requestedDeparture = max(departureDate, .now)
+        if allowWalking,
+           let metres = walkingDistance(from: origin, to: destination),
+           metres <= 1_200 {
+            let walk = T2CWalkingSegment(
+                origin: origin,
+                destination: destination,
+                distance: metres,
+                duration: max(60, metres / 1.25)
+            )
+            journeys.append(T2CJourney(
+                id: "walk|\(origin.id)|\(destination.id)|\(Int(requestedDeparture.timeIntervalSince1970))",
+                legs: [],
+                departureAt: requestedDeparture,
+                arrivalAt: requestedDeparture.addingTimeInterval(walk.duration),
+                directWalk: walk
+            ))
+        }
+        for candidate in candidates.prefix(16) {
+            var nextDeparture = requestedDeparture
+            for _ in 0..<5 {
+                guard let journey = await dateJourney(
+                    candidate,
+                    departureDate: nextDeparture
+                ) else { break }
+                journeys.append(journey)
+                nextDeparture = journey.departureAt.addingTimeInterval(60)
+            }
+        }
+
+        var unique: [String: T2CJourney] = [:]
+        for journey in journeys {
+            let signature = journey.legs.map { leg in
+                let minute = Int(leg.departureAt.timeIntervalSince1970 / 60)
+                return [
+                    normalize(leg.line.shortName),
+                    normalize(leg.origin.name),
+                    normalize(leg.destination.name),
+                    normalize(leg.direction),
+                    String(minute)
+                ].joined(separator: "|")
+            }.joined(separator: ">")
+            if let existing = unique[signature] {
+                if journey.arrivalAt < existing.arrivalAt { unique[signature] = journey }
+            } else {
+                unique[signature] = journey
+            }
+        }
+
+        return Array(unique.values)
+            .filter { $0.departureAt >= Date().addingTimeInterval(-30) }
+            .sorted {
+                if $0.departureAt != $1.departureAt { return $0.departureAt < $1.departureAt }
+                return $0.arrivalAt < $1.arrivalAt
+            }
+            .prefix(max(limit, 1))
+            .map { $0 }
+    }
+
+    private func buildJourneyCandidates(
+        from origin: NearbyStation,
+        to destination: NearbyStation,
+        index: GTFSIndex,
+        allowWalking: Bool
+    ) -> [[JourneyCandidateLeg]] {
+        let stationsByID = Dictionary(uniqueKeysWithValues: index.stations.map { ($0.id, $0) })
+        let stationIDByStop = Dictionary(
+            index.stations.flatMap { station in station.platforms.map { ($0.id, station.id) } },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let linesByID = Dictionary(uniqueKeysWithValues: index.lines.map { ($0.routeID, $0) })
+
+        var patterns: [JourneyPattern] = []
+        for line in index.lines {
+            for direction in index.directionsByRoute[line.routeID] ?? [] {
+                let key = makeDirectionKey(
+                    routeID: line.routeID,
+                    directionID: direction.directionID,
+                    directionName: direction.name
+                )
+                var stationIDs: [String] = []
+                for stop in index.stopsByDirection[key] ?? [] {
+                    guard let stationID = stationIDByStop[stop.stopID], stationID != stationIDs.last else { continue }
+                    stationIDs.append(stationID)
+                }
+                if stationIDs.count > 1 {
+                    patterns.append(JourneyPattern(lineID: line.routeID, direction: direction.name, stationIDs: stationIDs))
+                }
+            }
+        }
+
+        var patternsByStation: [String: [JourneyPattern]] = [:]
+        for pattern in patterns {
+            for stationID in Set(pattern.stationIDs) {
+                patternsByStation[stationID, default: []].append(pattern)
+            }
+        }
+
+        struct State {
+            let stationID: String
+            let legs: [JourneyCandidateLeg]
+            let stopTotal: Int
+        }
+        var queue = [State(stationID: origin.id, legs: [], stopTotal: 0)]
+        var cursor = 0
+        var bestDepth: [String: Int] = [origin.id + "|": 0]
+        var results: [State] = []
+
+        while cursor < queue.count, results.count < 60 {
+            let state = queue[cursor]
+            cursor += 1
+            guard state.legs.count < 3 else { continue }
+            let previousLineID = state.legs.last?.line.routeID
+
+            var boardingOptions: [(stationID: String, walk: T2CWalkingSegment?)] = [(state.stationID, nil)]
+            if allowWalking, let current = stationsByID[state.stationID] {
+                var nearby: [(stationID: String, walk: T2CWalkingSegment?)] = []
+                for candidate in index.stations where candidate.id != current.id {
+                    guard let metres = walkingDistance(from: current, to: candidate), metres <= 900 else { continue }
+                    let segment = T2CWalkingSegment(
+                        origin: current,
+                        destination: candidate,
+                        distance: metres,
+                        duration: max(60, metres / 1.25)
+                    )
+                    nearby.append((stationID: candidate.id, walk: segment))
+                }
+                nearby.sort { ($0.walk?.distance ?? 0) < ($1.walk?.distance ?? 0) }
+                boardingOptions.append(contentsOf: nearby.prefix(8))
+            }
+
+            for option in boardingOptions {
+              for pattern in patternsByStation[option.stationID] ?? [] where pattern.lineID != previousLineID {
+                guard let start = pattern.stationIDs.firstIndex(of: option.stationID),
+                      start < pattern.stationIDs.count - 1,
+                      let line = linesByID[pattern.lineID],
+                      let fromStation = stationsByID[option.stationID] else { continue }
+
+                for end in (start + 1)..<pattern.stationIDs.count {
+                    let nextID = pattern.stationIDs[end]
+                    guard let toStation = stationsByID[nextID] else { continue }
+                    let leg = JourneyCandidateLeg(
+                        line: line,
+                        origin: fromStation,
+                        destination: toStation,
+                        stations: pattern.stationIDs[start...end].compactMap { stationsByID[$0] },
+                        direction: pattern.direction,
+                        stopCount: end - start,
+                        walkBefore: option.walk
+                    )
+                    let next = State(
+                        stationID: nextID,
+                        legs: state.legs + [leg],
+                        stopTotal: state.stopTotal + end - start
+                    )
+                    if nextID == destination.id {
+                        results.append(next)
+                        continue
+                    }
+                    let key = nextID + "|" + line.routeID
+                    let depth = next.legs.count
+                    if depth <= (bestDepth[key] ?? Int.max) {
+                        bestDepth[key] = depth
+                        queue.append(next)
+                    }
+                }
+              }
+            }
+        }
+
+        var unique: [String: State] = [:]
+        for result in results {
+            let key = result.legs.map { $0.line.routeID + ":" + $0.origin.id + ">" + $0.destination.id }.joined(separator: "|")
+            if unique[key] == nil { unique[key] = result }
+        }
+        return unique.values.sorted {
+            if $0.legs.count != $1.legs.count { return $0.legs.count < $1.legs.count }
+            return $0.stopTotal < $1.stopTotal
+        }.prefix(8).map(\.legs)
+    }
+
+    private func dateJourney(
+        _ candidate: [JourneyCandidateLeg],
+        departureDate: Date
+    ) async -> T2CJourney? {
+        var readyAt = departureDate
+        var datedLegs: [T2CJourneyLeg] = []
+
+        for (index, leg) in candidate.enumerated() {
+            if let walk = leg.walkBefore { readyAt = readyAt.addingTimeInterval(walk.duration) }
+            if index > 0 { readyAt = readyAt.addingTimeInterval(180) }
+            let allDepartures = await journeyDepartures(for: leg)
+                .filter { $0.dueAt >= readyAt.addingTimeInterval(-30) && !$0.isCancelled }
+            let matchingDirection = allDepartures.filter { departure in
+                guard let destination = departure.destination, !destination.isEmpty else { return false }
+                let left = normalize(destination)
+                let right = normalize(leg.direction)
+                return left.contains(right) || right.contains(left)
+            }
+            guard let selectedDeparture = (matchingDirection.isEmpty ? allDepartures : matchingDirection)
+                .min(by: { $0.dueAt < $1.dueAt }) else { return nil }
+
+            let departAt = selectedDeparture.dueAt
+            let secondsPerStop: TimeInterval = leg.line.isTram ? 105 : 135
+            let arriveAt = departAt.addingTimeInterval(Double(max(leg.stopCount, 1)) * secondsPerStop)
+            let buffer = index == 0 ? nil : departAt.timeIntervalSince(datedLegs[index - 1].arrivalAt)
+            datedLegs.append(T2CJourneyLeg(
+                id: "\(index)|\(leg.line.routeID)|\(leg.origin.id)|\(leg.destination.id)",
+                line: leg.line,
+                origin: leg.origin,
+                destination: leg.destination,
+                stations: leg.stations,
+                direction: leg.direction,
+                stopCount: leg.stopCount,
+                departureAt: departAt,
+                arrivalAt: arriveAt,
+                isRealtime: selectedDeparture.isRealtime,
+                transferBuffer: buffer,
+                walkBefore: leg.walkBefore
+            ))
+            readyAt = arriveAt
+        }
+
+        guard let first = datedLegs.first, let last = datedLegs.last else { return nil }
+        return T2CJourney(
+            id: datedLegs.map(\.id).joined(separator: "|") + "|\(Int(first.departureAt.timeIntervalSince1970))",
+            legs: datedLegs,
+            departureAt: first.departureAt,
+            arrivalAt: last.arrivalAt,
+            directWalk: nil
+        )
+    }
+
+    private func walkingDistance(from lhs: NearbyStation, to rhs: NearbyStation) -> CLLocationDistance? {
+        let left = lhs.platforms.compactMap { platform -> CLLocation? in
+            guard let latitude = platform.latitude, let longitude = platform.longitude else { return nil }
+            return CLLocation(latitude: latitude, longitude: longitude)
+        }
+        let right = rhs.platforms.compactMap { platform -> CLLocation? in
+            guard let latitude = platform.latitude, let longitude = platform.longitude else { return nil }
+            return CLLocation(latitude: latitude, longitude: longitude)
+        }
+        return left.flatMap { a in right.map { a.distance(from: $0) } }.min()
+    }
+
+    private func journeyDepartures(for leg: JourneyCandidateLeg) async -> [T2CDeparture] {
+        let cacheKey = leg.origin.id + "|" + leg.line.routeID
+        if let cached = journeyDepartureCache[cacheKey],
+           Date().timeIntervalSince(cached.loadedAt) < 20 {
+            return cached.departures
+        }
+
+        var departures: [T2CDeparture] = []
+        for platform in leg.origin.platforms where platform.routeIDs.contains(leg.line.routeID) {
+            guard let result = try? await getTimetable(stopID: platform.id, line: leg.line, limit: 40) else { continue }
+            departures.append(contentsOf: result.realtimeDepartures)
+            departures.append(contentsOf: result.theoreticalDepartures)
+        }
+        var unique: [String: T2CDeparture] = [:]
+        for departure in departures where !departure.isCancelled {
+            let key = "\(Int(departure.dueAt.timeIntervalSince1970))|\(normalize(departure.destination ?? ""))"
+            if unique[key] == nil || (departure.isRealtime && unique[key]?.isRealtime != true) {
+                unique[key] = departure
+            }
+        }
+        let sorted = unique.values.sorted { $0.dueAt < $1.dueAt }
+        journeyDepartureCache[cacheKey] = JourneyDepartureCache(loadedAt: .now, departures: sorted)
+        return sorted
     }
 
     // MARK: - Directions
@@ -192,16 +518,20 @@ actor T2CService {
         let rawDepartures =
             rawResponse.timetable?.timetable ?? []
 
+        let referencedLineIDs = Set(
+            (rawResponse.referentialLine ?? [])
+                .filter { normalize($0.shortName) == normalize(line.shortName) }
+                .map { normalize($0.lineID) }
+        )
+
         var realtime: [T2CDeparture] = []
         var theoretical: [T2CDeparture] = []
         var cancelled: [T2CDeparture] = []
 
         for raw in rawDepartures {
 
-            guard matchesLine(
-                raw.lineID,
-                line: line
-            ) else {
+            guard matchesLine(raw.lineID, line: line)
+                    || raw.lineID.map { referencedLineIDs.contains(normalize($0)) } == true else {
                 continue
             }
 
@@ -250,6 +580,36 @@ actor T2CService {
                     departure
                 )
             }
+        }
+
+        // Le référentiel QR T2C peut rester sur l'ancienne numérotation alors
+        // que le GTFS public contient déjà la nouvelle ligne. Dans ce cas, on
+        // affiche les horaires théoriques officiels du GTFS au lieu d'annoncer
+        // à tort qu'aucun passage n'existe.
+        if realtime.isEmpty, theoretical.isEmpty, cancelled.isEmpty,
+           let gtfsIndex {
+            let key = stopID + "|" + line.routeID
+            let now = Date()
+            theoretical = (gtfsIndex.scheduledDeparturesByStopAndRoute[key] ?? [])
+                .filter {
+                    $0.dueAt >= now.addingTimeInterval(-60)
+                        && $0.dueAt <= now.addingTimeInterval(6 * 3600)
+                }
+                .prefix(limit)
+                .map {
+                    T2CDeparture(
+                        routeID: line.routeID,
+                        routeName: line.shortName,
+                        stopID: stopID,
+                        destination: $0.destination,
+                        dueAt: $0.dueAt,
+                        scheduledAt: $0.dueAt,
+                        estimatedAt: nil,
+                        status: nil,
+                        theoretical: true,
+                        info: nil
+                    )
+                }
         }
 
         realtime.sort {
@@ -330,6 +690,7 @@ actor T2CService {
             try findGTFSURL(
                 in: metadata
             )
+        gtfsResourceURL = gtfsURL
 
         let (temporaryURL, response) =
             try await URLSession.shared.download(
@@ -496,6 +857,9 @@ actor T2CService {
                 from: archive
             )
 
+        let calendarText = try extractText("calendar.txt", from: archive)
+        let calendarDatesText = try extractText("calendar_dates.txt", from: archive)
+
         let lines =
             parseRoutesCSV(
                 routesText
@@ -517,12 +881,21 @@ actor T2CService {
                 trips: trips
             )
 
-        let routeStops =
+        let activeServiceDates = buildActiveServiceDates(
+            calendarText: calendarText,
+            calendarDatesText: calendarDatesText,
+            around: .now
+        )
+
+        let routeData =
             buildRouteStopsStreaming(
                 stopTimesText: stopTimesText,
                 trips: trips,
-                stops: stops
+                stops: stops,
+                activeServiceDates: activeServiceDates
             )
+
+        let routeStops = routeData.stops
 
         return GTFSIndex(
             stations: buildStations(text: stopsText, lines: lines, directions: directions, routeStops: routeStops),
@@ -530,7 +903,9 @@ actor T2CService {
             directionsByRoute:
                 directions,
             stopsByDirection:
-                routeStops
+                routeStops,
+            scheduledDeparturesByStopAndRoute:
+                routeData.departures
         )
     }
 
@@ -580,7 +955,7 @@ actor T2CService {
         return stations.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
-    private func extractText(
+    nonisolated private func extractText(
         _ filename: String,
         from archive: Archive
     ) throws -> String {
@@ -840,7 +1215,7 @@ actor T2CService {
 
     // MARK: - Trips
 
-    private func parseTripsCSV(
+    nonisolated private func parseTripsCSV(
         _ text: String
     ) -> [String: TripInfo] {
 
@@ -879,6 +1254,9 @@ actor T2CService {
             headers.firstIndex(
                 of: "trip_headsign"
             )
+
+        let serviceIDIndex = headers.firstIndex(of: "service_id")
+        let shapeIDIndex = headers.firstIndex(of: "shape_id")
 
         var result:
             [String: TripInfo] = [:]
@@ -919,6 +1297,8 @@ actor T2CService {
             result[tripID] =
                 TripInfo(
                     routeID: routeID,
+                    serviceID: value(row, at: serviceIDIndex),
+                    shapeID: value(row, at: shapeIDIndex),
                     directionID:
                         directionID,
                     headsign:
@@ -927,6 +1307,170 @@ actor T2CService {
         }
 
         return result
+    }
+
+    nonisolated private func buildLineShapes(
+        routeID: String,
+        tripsText: String,
+        shapesText: String
+    ) -> [T2CLineShape] {
+        let descriptors = parseTripsCSV(tripsText).values
+            .filter { $0.routeID == routeID && !$0.shapeID.isEmpty }
+
+        var descriptorByShape: [String: TripInfo] = [:]
+        for descriptor in descriptors where descriptorByShape[descriptor.shapeID] == nil {
+            descriptorByShape[descriptor.shapeID] = descriptor
+        }
+        guard !descriptorByShape.isEmpty else { return [] }
+
+        var shapeIDIndex: Int?
+        var latitudeIndex: Int?
+        var longitudeIndex: Int?
+        var sequenceIndex: Int?
+        var readHeader = false
+        var pointsByShape: [String: [(sequence: Int, point: T2CShapePoint)]] = [:]
+
+        shapesText.enumerateLines { line, _ in
+            let row = line.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+            if !readHeader {
+                let headers = self.normalizedHeaders(row)
+                shapeIDIndex = headers.firstIndex(of: "shape_id")
+                latitudeIndex = headers.firstIndex(of: "shape_pt_lat")
+                longitudeIndex = headers.firstIndex(of: "shape_pt_lon")
+                sequenceIndex = headers.firstIndex(of: "shape_pt_sequence")
+                readHeader = true
+                return
+            }
+            let shapeID = self.value(row, at: shapeIDIndex)
+            guard descriptorByShape[shapeID] != nil,
+                  let latitude = Double(self.value(row, at: latitudeIndex)),
+                  let longitude = Double(self.value(row, at: longitudeIndex)) else { return }
+            let sequence = Int(self.value(row, at: sequenceIndex)) ?? Int.max
+            pointsByShape[shapeID, default: []].append((sequence, T2CShapePoint(latitude: latitude, longitude: longitude)))
+        }
+
+        // Plusieurs courses réutilisent des géométries proches, mais certaines
+        // lignes ont aussi de vraies variantes de parcours pour une même
+        // destination. On déduplique donc par géométrie plutôt que de supprimer
+        // ces branches utiles.
+        var bestByVariant: [String: T2CLineShape] = [:]
+        for (shapeID, values) in pointsByShape {
+            guard let descriptor = descriptorByShape[shapeID] else { continue }
+            let points = values.sorted { $0.sequence < $1.sequence }.map(\.point)
+            guard points.count > 1 else { continue }
+            let sampleIndexes = [0, points.count / 4, points.count / 2, (points.count * 3) / 4, points.count - 1]
+            let geometryKey = sampleIndexes.map { index in
+                let point = points[index]
+                return String(format: "%.3f,%.3f", point.latitude, point.longitude)
+            }.joined(separator: "|")
+            let key = descriptor.directionID + "|" + normalize(descriptor.headsign) + "|" + geometryKey
+            let maximumPointCount = 600
+            let stride = max(1, Int(ceil(Double(points.count) / Double(maximumPointCount))))
+            var reducedPoints = Swift.stride(from: 0, to: points.count, by: stride).map { points[$0] }
+            if reducedPoints.last != points.last, let last = points.last { reducedPoints.append(last) }
+            let candidate = T2CLineShape(
+                id: shapeID,
+                directionID: descriptor.directionID,
+                destination: descriptor.headsign,
+                points: reducedPoints
+            )
+            if candidate.points.count > (bestByVariant[key]?.points.count ?? 0) {
+                bestByVariant[key] = candidate
+            }
+        }
+        // Un seul parcours officiel par sens/destination. Le plus complet
+        // conserve les arrêts voyageurs des courses régulières, sans créer la
+        // superposition illisible de plusieurs variantes.
+        let limited = Dictionary(grouping: bestByVariant.values) {
+            $0.directionID + "|" + normalize($0.destination)
+        }.values.compactMap { variants in
+            variants.max { approximateLength(of: $0) < approximateLength(of: $1) }
+        }
+        return limited.sorted {
+            if $0.directionID != $1.directionID { return $0.directionID < $1.directionID }
+            return $0.destination.localizedStandardCompare($1.destination) == .orderedAscending
+        }
+    }
+
+    nonisolated private func approximateLength(of shape: T2CLineShape) -> Double {
+        guard shape.points.count > 1 else { return 0 }
+        return zip(shape.points, shape.points.dropFirst()).reduce(0) { total, pair in
+            let latitude = (pair.0.latitude + pair.1.latitude) * .pi / 360
+            let latitudeDelta = pair.1.latitude - pair.0.latitude
+            let longitudeDelta = (pair.1.longitude - pair.0.longitude) * cos(latitude)
+            return total + hypot(latitudeDelta, longitudeDelta)
+        }
+    }
+
+    private var parisCalendar: Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = Locale(identifier: "fr_FR")
+        calendar.timeZone = TimeZone(identifier: "Europe/Paris")!
+        return calendar
+    }
+
+    private func gtfsSeconds(_ value: String) -> TimeInterval? {
+        let parts = value.split(separator: ":").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+        return TimeInterval(parts[0] * 3600 + parts[1] * 60 + parts[2])
+    }
+
+    private func buildActiveServiceDates(
+        calendarText: String,
+        calendarDatesText: String,
+        around date: Date
+    ) -> [String: [Date]] {
+        let calendar = parisCalendar
+        let dates = (-1...1).compactMap { calendar.date(byAdding: .day, value: $0, to: date) }
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = calendar.timeZone
+        formatter.dateFormat = "yyyyMMdd"
+
+        let weekdayColumn = [
+            1: "sunday", 2: "monday", 3: "tuesday", 4: "wednesday",
+            5: "thursday", 6: "friday", 7: "saturday"
+        ]
+        var active: [String: Set<String>] = [:]
+        let calendarRows = parseCSV(calendarText)
+        if let header = calendarRows.first {
+            let headers = normalizedHeaders(header)
+            for row in calendarRows.dropFirst() {
+                let serviceID = value(row, at: headers.firstIndex(of: "service_id"))
+                let start = value(row, at: headers.firstIndex(of: "start_date"))
+                let end = value(row, at: headers.firstIndex(of: "end_date"))
+                guard !serviceID.isEmpty else { continue }
+                for candidate in dates {
+                    let code = formatter.string(from: candidate)
+                    let weekday = calendar.component(.weekday, from: candidate)
+                    guard code >= start, code <= end,
+                          let column = weekdayColumn[weekday],
+                          value(row, at: headers.firstIndex(of: column)) == "1" else { continue }
+                    active[serviceID, default: []].insert(code)
+                }
+            }
+        }
+
+        let exceptionRows = parseCSV(calendarDatesText)
+        if let header = exceptionRows.first {
+            let headers = normalizedHeaders(header)
+            let relevantCodes = Set(dates.map { formatter.string(from: $0) })
+            for row in exceptionRows.dropFirst() {
+                let serviceID = value(row, at: headers.firstIndex(of: "service_id"))
+                let code = value(row, at: headers.firstIndex(of: "date"))
+                guard relevantCodes.contains(code), !serviceID.isEmpty else { continue }
+                if value(row, at: headers.firstIndex(of: "exception_type")) == "1" {
+                    active[serviceID, default: []].insert(code)
+                } else {
+                    active[serviceID]?.remove(code)
+                }
+            }
+        }
+
+        return active.mapValues { codes in
+            codes.compactMap { formatter.date(from: $0) }.sorted()
+        }
     }
 
     // MARK: - Directions
@@ -989,13 +1533,45 @@ actor T2CService {
     private func buildRouteStopsStreaming(
         stopTimesText: String,
         trips: [String: TripInfo],
-        stops: [String: String]
-    ) -> [String: [T2CStop]] {
+        stops: [String: String],
+        activeServiceDates: [String: [Date]]
+    ) -> (stops: [String: [T2CStop]], departures: [String: [GTFSScheduledDeparture]]) {
         var tripIDIndex: Int?
         var stopIDIndex: Int?
         var sequenceIndex: Int?
+        var departureTimeIndex: Int?
+        var pickupTypeIndex: Int?
         var hasReadHeader = false
-        var collected: [String: [String: StopSequence]] = [:]
+        // Un même sens contient de nombreux voyages (journée, renforts et
+        // services partiels). Les mélanger arrêt par arrêt produit un parcours
+        // qui n'existe pas. Le fichier étant ordonné par voyage, on compare les
+        // voyages complets au fil de la lecture sans les garder tous en mémoire.
+        var bestTripByDirection: [String: [StopSequence]] = [:]
+        var currentTripID: String?
+        var currentTrip: TripInfo?
+        var currentStops: [StopSequence] = []
+        var scheduledDepartures: [String: [GTFSScheduledDeparture]] = [:]
+
+        func keepCurrentTripIfNeeded() {
+            guard let trip = currentTrip, !currentStops.isEmpty else {
+                currentStops.removeAll(keepingCapacity: true)
+                return
+            }
+            let key = makeDirectionKey(
+                routeID: trip.routeID,
+                directionID: trip.directionID,
+                directionName: trip.headsign
+            )
+            let ordered = currentStops.sorted { $0.sequence < $1.sequence }
+            let candidateCount = Set(ordered.map(\.stopID)).count
+            let previousCount = Set(bestTripByDirection[key, default: []].map(\.stopID)).count
+            if candidateCount > previousCount
+                || (candidateCount == previousCount
+                    && (ordered.last?.sequence ?? 0) > (bestTripByDirection[key]?.last?.sequence ?? 0)) {
+                bestTripByDirection[key] = ordered
+            }
+            currentStops.removeAll(keepingCapacity: true)
+        }
 
         stopTimesText.enumerateLines { line, _ in
             // GTFS stop_times fields are identifiers, times and numeric flags;
@@ -1011,6 +1587,8 @@ actor T2CService {
                 tripIDIndex = headers.firstIndex(of: "trip_id")
                 stopIDIndex = headers.firstIndex(of: "stop_id")
                 sequenceIndex = headers.firstIndex(of: "stop_sequence")
+                departureTimeIndex = headers.firstIndex(of: "departure_time")
+                pickupTypeIndex = headers.firstIndex(of: "pickup_type")
                 hasReadHeader = true
                 return
             }
@@ -1018,38 +1596,55 @@ actor T2CService {
             guard let tripIDIndex, let stopIDIndex else { return }
             let tripID = self.value(row, at: tripIDIndex)
             let stopID = self.value(row, at: stopIDIndex)
-            guard let trip = trips[tripID], !stopID.isEmpty else { return }
+            if currentTripID != tripID {
+                keepCurrentTripIfNeeded()
+                currentTripID = tripID
+                currentTrip = trips[tripID]
+            }
+            guard let trip = currentTrip, !stopID.isEmpty else { return }
 
             let sequence = Int(self.value(row, at: sequenceIndex)) ?? Int.max
-            let key = self.makeDirectionKey(
-                routeID: trip.routeID,
-                directionID: trip.directionID,
-                directionName: trip.headsign
-            )
-            let previous = collected[key]?[stopID]
-            guard previous == nil || sequence < previous!.sequence else { return }
-
-            collected[key, default: [:]][stopID] = StopSequence(
+            currentStops.append(StopSequence(
                 stopID: stopID,
                 name: stops[stopID] ?? stopID,
                 sequence: sequence,
                 directionID: trip.directionID,
                 directionName: trip.headsign
-            )
-        }
+            ))
 
-        return collected.mapValues { stopDictionary in
-            stopDictionary.values
-                .sorted { $0.sequence < $1.sequence }
-                .map {
-                    T2CStop(
-                        stopID: $0.stopID,
-                        name: $0.name,
-                        directionID: $0.directionID,
-                        directionName: $0.directionName
+            let pickupType = self.value(row, at: pickupTypeIndex)
+            if pickupType != "1",
+               let seconds = self.gtfsSeconds(self.value(row, at: departureTimeIndex)) {
+                let calendar = self.parisCalendar
+                let key = stopID + "|" + trip.routeID
+                for serviceDate in activeServiceDates[trip.serviceID] ?? [] {
+                    scheduledDepartures[key, default: []].append(
+                        GTFSScheduledDeparture(
+                            destination: trip.headsign,
+                            dueAt: calendar.startOfDay(for: serviceDate).addingTimeInterval(seconds)
+                        )
                     )
                 }
+            }
         }
+        keepCurrentTripIfNeeded()
+
+        let canonicalStops: [String: [T2CStop]] = bestTripByDirection.mapValues { canonical in
+            var seenStops = Set<String>()
+            return canonical.compactMap { stop -> T2CStop? in
+                guard seenStops.insert(stop.stopID).inserted else { return nil }
+                return T2CStop(
+                    stopID: stop.stopID,
+                    name: stop.name,
+                    directionID: stop.directionID,
+                    directionName: stop.directionName
+                )
+            }
+        }
+        return (
+            stops: canonicalStops,
+            departures: scheduledDepartures.mapValues { $0.sorted { $0.dueAt < $1.dueAt } }
+        )
     }
 
     private func buildRouteStops(
@@ -1293,7 +1888,7 @@ actor T2CService {
             )
     }
 
-    private func normalize(
+    nonisolated private func normalize(
         _ value: String
     ) -> String {
 
@@ -1317,7 +1912,7 @@ actor T2CService {
 
     // MARK: - CSV
 
-    private func normalizedHeaders(
+    nonisolated private func normalizedHeaders(
         _ row: [String]
     ) -> [String] {
 
@@ -1335,7 +1930,7 @@ actor T2CService {
         }
     }
 
-    private func value(
+    nonisolated private func value(
         _ row: [String],
         at index: Int?
     ) -> String {
@@ -1356,7 +1951,7 @@ actor T2CService {
             )
     }
 
-    private func parseCSV(
+    nonisolated private func parseCSV(
         _ text: String
     ) -> [[String]] {
 
@@ -1522,13 +2117,35 @@ private struct GTFSIndex {
 
     let stopsByDirection:
         [String: [T2CStop]]
+
+    let scheduledDeparturesByStopAndRoute:
+        [String: [GTFSScheduledDeparture]]
 }
 
 private struct TripInfo {
 
     let routeID: String
+    let serviceID: String
+    let shapeID: String
     let directionID: String
     let headsign: String
+}
+
+struct T2CShapePoint: Sendable, Hashable {
+    let latitude: Double
+    let longitude: Double
+}
+
+struct T2CLineShape: Identifiable, Sendable {
+    let id: String
+    let directionID: String
+    let destination: String
+    let points: [T2CShapePoint]
+}
+
+private struct GTFSScheduledDeparture {
+    let destination: String
+    let dueAt: Date
 }
 
 private struct StopSequence {
@@ -1540,6 +2157,27 @@ private struct StopSequence {
 
     let directionID: String
     let directionName: String
+}
+
+private struct JourneyPattern {
+    let lineID: String
+    let direction: String
+    let stationIDs: [String]
+}
+
+private struct JourneyCandidateLeg {
+    let line: T2CLine
+    let origin: NearbyStation
+    let destination: NearbyStation
+    let stations: [NearbyStation]
+    let direction: String
+    let stopCount: Int
+    let walkBefore: T2CWalkingSegment?
+}
+
+private struct JourneyDepartureCache {
+    let loadedAt: Date
+    let departures: [T2CDeparture]
 }
 
 // MARK: - Dataset
@@ -1570,6 +2208,25 @@ private struct RawTimetableResponse: Decodable {
 
     let message:
         [RawInfoMessage]?
+
+    let referentialLine:
+        [RawReferentialLine]?
+
+    enum CodingKeys: String, CodingKey {
+        case timetable
+        case message
+        case referentialLine = "referential_line"
+    }
+}
+
+private struct RawReferentialLine: Decodable {
+    let lineID: String
+    let shortName: String
+
+    enum CodingKeys: String, CodingKey {
+        case lineID = "line_id"
+        case shortName = "short_name"
+    }
 }
 
 private struct RawTimetableContainer: Decodable {

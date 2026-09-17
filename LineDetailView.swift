@@ -23,7 +23,7 @@ struct LineStopsView: View {
 
     private var results: [NearbyStation] {
         let value = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let filtered = value.isEmpty ? stations : stations.filter { $0.name.localizedStandardContains(value) }
+        let filtered = value.isEmpty ? stations : stations.filter { StationSearch.matches($0.name, query: value) }
         return filtered.sorted {
             let a = favorites.isStationFavorite($0), b = favorites.isStationFavorite($1)
             return a == b ? $0.name.localizedStandardCompare($1.name) == .orderedAscending : a

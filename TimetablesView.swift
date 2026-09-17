@@ -101,7 +101,10 @@ struct SearchField: View {
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-            TextField(placeholder, text: $text).autocorrectionDisabled().submitLabel(.search)
+            TextField(placeholder, text: $text)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+                .submitLabel(.search)
             if !text.isEmpty {
                 Button { text = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
                     .accessibilityLabel("Effacer la recherche")

@@ -28,7 +28,7 @@ struct ContentView: View {
                             .accessibilityLabel("T2C")
                         VStack(spacing: 12) {
                             BrandTitle(large: true)
-                            Text("Votre prochain départ.")
+                            Text("Déplacez vous dans l'agglomération Clermontoise et découvrez les meilleures options de transport en commun.")
                                 .font(.subheadline).foregroundStyle(.secondary)
                         }
                         .opacity(titleVisible ? 1 : 0)
@@ -118,23 +118,33 @@ struct MainTabsView: View {
         TabView {
             HomeView()
                 .tabItem { Label("Accueil", systemImage: "house.fill") }
+            ItineraryView()
+                .tabItem { Label("Itinéraire", systemImage: "arrow.triangle.turn.up.right.diamond.fill") }
             TimetablesView()
                 .tabItem { Label("Horaires", systemImage: "clock.fill") }
             ThermometerView()
-                .tabItem { Label("Thermomètre", systemImage: "thermometer.medium") }
-            SettingsView()
-                .tabItem { Label("Paramètres", systemImage: "gearshape.fill") }
+                .tabItem { Label("Lignes", systemImage: "point.3.connected.trianglepath.dotted") }
         }
     }
 }
 
 struct BrandTitle: View {
     var large = false
+    @State private var appeared = false
+
     var body: some View {
         Text("ClermonTard")
             .font(.system(size: large ? 40 : 32, weight: .bold, design: .default))
             .tracking(large ? -1.8 : -1.2)
             .lineLimit(1).minimumScaleFactor(0.65)
+            .opacity(appeared ? 1 : 0.72)
+            .scaleEffect(appeared ? 1 : 0.96)
+            .offset(y: appeared ? 0 : 3)
+            .onAppear {
+                withAnimation(.spring(response: 0.65, dampingFraction: 0.72).delay(0.08)) {
+                    appeared = true
+                }
+            }
     }
 }
 
@@ -145,6 +155,7 @@ struct BrandHeader: View {
             Image("Logo_T2C")
                 .resizable().scaledToFit()
                 .frame(width: large ? 132 : 78, height: large ? 112 : 65)
+                .scaleEffect(large ? 1 : 1.32)
                 .accessibilityLabel("T2C")
             BrandTitle(large: large)
         }.frame(maxWidth: .infinity)

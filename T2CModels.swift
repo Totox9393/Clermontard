@@ -4,6 +4,79 @@
 //
 
 import Foundation
+import CoreLocation
+
+// MARK: - Recherche d'arrêts
+
+enum StationSearch {
+    private static let tokenAliases: [String: [String]] = [
+        "pl": ["place"],
+        "av": ["avenue"],
+        "rte": ["route"],
+        "st": ["saint"],
+        "ste": ["sainte"],
+        "dr": ["docteur"],
+        "chu": ["centre", "hospitalier", "hopital"],
+        "uca": ["universite", "clermont", "auvergne"],
+        "zi": ["zone", "industrielle"],
+        "rn": ["route", "nationale"],
+        "fac": ["faculte"]
+    ]
+
+    private static let nameAliases: [(abbreviated: String, expanded: String)] = [
+        ("g montpied", "gabriel montpied"),
+        ("m michelin", "marcel michelin"),
+        ("p marcombes", "philippe marcombes"),
+        ("l michel", "louise michel"),
+        ("j ferry", "jules ferry"),
+        ("a camus", "albert camus"),
+        ("a brugiere", "ambroise brugiere"),
+        ("m boubat", "marcel boubat"),
+        ("v g e", "valery giscard estaing")
+    ]
+
+    static func matches(_ stationName: String, query: String) -> Bool {
+        let searchedTokens = normalizedTokens(query)
+        guard !searchedTokens.isEmpty else { return true }
+
+        let stationTokens = searchableTokens(stationName)
+        return searchedTokens.allSatisfy { searched in
+            stationTokens.contains { candidate in
+                candidate == searched || (searched.count >= 4 && candidate.hasPrefix(searched))
+            }
+        }
+    }
+
+    private static func searchableTokens(_ stationName: String) -> [String] {
+        let normalizedName = normalize(stationName)
+        let originalTokens = normalizedName.split(separator: " ").map(String.init)
+        var tokens = originalTokens
+
+        for token in originalTokens {
+            tokens.append(contentsOf: tokenAliases[token] ?? [])
+        }
+        for alias in nameAliases where containsPhrase(normalizedName, alias.abbreviated) {
+            tokens.append(contentsOf: alias.expanded.split(separator: " ").map(String.init))
+        }
+        return tokens
+    }
+
+    private static func normalizedTokens(_ value: String) -> [String] {
+        normalize(value).split(separator: " ").map(String.init)
+    }
+
+    private static func containsPhrase(_ value: String, _ phrase: String) -> Bool {
+        " \(value) ".contains(" \(phrase) ")
+    }
+
+    private static func normalize(_ value: String) -> String {
+        let folded = value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        let words = folded.unicodeScalars.map { scalar -> Character in
+            CharacterSet.alphanumerics.contains(scalar) ? Character(String(scalar)) : " "
+        }
+        return String(words).split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+}
 
 // MARK: - Ligne
 
@@ -365,4 +438,43 @@ struct StationPlatform: Identifiable, Hashable, Sendable {
     let latitude: Double?
     let longitude: Double?
     let routeIDs: Set<String>
+}
+
+// MARK: - Itinéraires
+
+struct T2CJourney: Identifiable, Hashable, Sendable {
+    let id: String
+    let legs: [T2CJourneyLeg]
+    let departureAt: Date
+    let arrivalAt: Date
+    let directWalk: T2CWalkingSegment?
+
+    var duration: TimeInterval { arrivalAt.timeIntervalSince(departureAt) }
+    var transferCount: Int { max(legs.count - 1, 0) }
+    var usesRealtime: Bool { legs.contains(where: \.isRealtime) }
+    var walkingDuration: TimeInterval {
+        directWalk?.duration ?? legs.compactMap(\.walkBefore).reduce(0) { $0 + $1.duration }
+    }
+}
+
+struct T2CWalkingSegment: Hashable, Sendable {
+    let origin: NearbyStation
+    let destination: NearbyStation
+    let distance: CLLocationDistance
+    let duration: TimeInterval
+}
+
+struct T2CJourneyLeg: Identifiable, Hashable, Sendable {
+    let id: String
+    let line: T2CLine
+    let origin: NearbyStation
+    let destination: NearbyStation
+    let stations: [NearbyStation]
+    let direction: String
+    let stopCount: Int
+    let departureAt: Date
+    let arrivalAt: Date
+    let isRealtime: Bool
+    let transferBuffer: TimeInterval?
+    let walkBefore: T2CWalkingSegment?
 }
